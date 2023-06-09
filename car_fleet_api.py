@@ -2,7 +2,7 @@ from flask import Flask, request
 from flask_restful import Api, Resource
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
-import requests
+from requests import get
 from passlib.hash import pbkdf2_sha512
 
 app = Flask(__name__)
@@ -11,86 +11,64 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 api = Api(app)
 db = SQLAlchemy(app)
 
+# Model representing the Car table in the database
 class CarModel(db.Model):
     __tablename__ = 'cars'
-
     id = db.Column(db.Integer, primary_key=True)
-    license_plate = db.Column(db.String(10), unique=True, nullable=False)
+    license_plate = db.Column(db.String(20), unique=True, nullable=False)
     driver_id = db.Column(db.Integer, db.ForeignKey('drivers.id'))
-    positions = db.relationship('PositionModel', backref='car', lazy='dynamic')
 
     def json(self):
         return {'id': self.id, 'license_plate': self.license_plate, 'driver_id': self.driver_id}
 
+    @classmethod
+    def find_by_attribute(cls, **kwargs):
+        return cls.query.filter_by(**kwargs).first()
+
+# Model representing the Driver table in the database
 class DriverModel(db.Model):
     __tablename__ = 'drivers'
-
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(80), nullable=False)
-    cars = db.relationship('CarModel', backref='driver', lazy='dynamic')
+    name = db.Column(db.String(100), nullable=False)
 
     def json(self):
         return {'id': self.id, 'name': self.name}
 
+    @classmethod
+    def find_by_attribute(cls, **kwargs):
+        return cls.query.filter_by(**kwargs).first()
+
+# Model representing the Position table in the database
 class PositionModel(db.Model):
     __tablename__ = 'positions'
-
     id = db.Column(db.Integer, primary_key=True)
+    car_id = db.Column(db.Integer, db.ForeignKey('cars.id'))
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
-    date = db.Column(db.DateTime, default=datetime.utcnow)
-    car_id = db.Column(db.Integer, db.ForeignKey('cars.id'), nullable=False)
+    date = db.Column(db.DateTime, nullable=False)
     address = db.Column(db.String(300))
 
     def json(self):
         return {
             'id': self.id,
+            'car_id': self.car_id,
             'latitude': self.latitude,
             'longitude': self.longitude,
             'date': self.date.isoformat(),
-            'car_id': self.car_id,
             'address': self.address
         }
 
     def resolve_address(self):
-        url = f"https://nominatim.openstreetmap.org/reverse?lat={self.latitude}&lon={self.longitude}&format=json"
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            self.address = data.get('display_name', '')
+        # Use the Nominatim API to get the address based on GPS coordinates
+        url = f"https://nominatim.org/search?q={self.latitude}+{self.longitude}&format=json"
+        response = get(url).json()
+        if response:
+            self.address = response[0].get('display_name', '')
         else:
             self.address = ''
 
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.get_json()
-    if 'username' not in data or 'password' not in data:
-        return {"message": "Username and password are required"}, 400
-
-    if UserModel.find_by_username(data['username']):
-        return {"message": "Username already exists"}, 400
-
-    user = UserModel(username=data['username'], password=UserModel.generate_hash(data['password']))
-    db.session.add(user)
-    db.session.commit()
-    return {"message": "User registered successfully"}, 201
-
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    if 'username' not in data or 'password' not in data:
-        return {"message": "Username and password are required"}, 400
-
-    user = UserModel.find_by_username(data['username'])
-    if user and UserModel.verify_hash(data['password'], user.password):
-        return {"message": "Login successful"}, 200
-    return {"message": "Invalid credentials"}, 401
-
+# Resource for managing individual cars
 class Car(Resource):
-    @classmethod
-    def find_by_attribute(cls, **kwargs):
-        return cls.query.filter_by(**kwargs).first()
-
     def get(self, plate):
         car = CarModel.find_by_attribute(license_plate=plate)
         if car:
@@ -136,11 +114,13 @@ class Car(Resource):
         db.session.commit()
         return {'message': 'Car deleted'}
 
+# Resource for managing the list of cars
 class CarList(Resource):
     def get(self):
-        cars = CarModel.query.all()
-        return {'cars': [car.json() for car in cars]}
+        cars = [car.json() for car in CarModel.query.all()]
+        return {'cars': cars}
 
+# Resource for managing car positions
 class CarPosition(Resource):
     def post(self, plate):
         car = CarModel.find_by_attribute(license_plate=plate)
@@ -152,24 +132,26 @@ class CarPosition(Resource):
         longitude = data.get('longitude')
 
         if not isinstance(latitude, float) or not isinstance(longitude, float):
-            return {'message': 'Latitude and longitude must be floats'}, 400
+            return {'message': 'Invalid latitude or longitude'}, 400
 
-        car_position = PositionModel(car_id=car.id, latitude=latitude, longitude=longitude)
-        car_position.date = datetime.now()
+        car_position = PositionModel(car_id=car.id, latitude=latitude, longitude=longitude, date=datetime.now())
         car_position.resolve_address()
+
         db.session.add(car_position)
         db.session.commit()
-        return {'message': 'Position saved successfully'}, 201
+        return {'message': 'Position saved'}, 201
 
+# Resource for getting car positions
 class CarPositions(Resource):
     def get(self, plate):
         car = CarModel.find_by_attribute(license_plate=plate)
         if not car:
             return {'message': 'Car not found'}, 404
 
-        positions = PositionModel.query.filter_by(car_id=car.id).all()
-        return {'positions': [position.json() for position in positions]}
+        positions = [position.json() for position in PositionModel.query.filter_by(car_id=car.id).all()]
+        return {'positions': positions}
 
+# Resource for assigning a driver to a car
 class AssignDriver(Resource):
     def post(self, plate, driver_id):
         car = CarModel.find_by_attribute(license_plate=plate)
@@ -180,26 +162,23 @@ class AssignDriver(Resource):
         if not driver:
             return {'message': 'Driver not found'}, 404
 
-        car.driver_id = driver.id
+        car.driver_id = driver_id
         db.session.commit()
-        return {'message': 'Driver assigned successfully'}
+        return {'message': 'Driver assigned'}
 
     def delete(self, plate, driver_id):
         car = CarModel.find_by_attribute(license_plate=plate)
         if not car:
             return {'message': 'Car not found'}, 404
 
-        driver = DriverModel.find_by_attribute(id=driver_id)
-        if not driver:
-            return {'message': 'Driver not found'}, 404
-
-        if car.driver_id != driver.id:
-            return {'message': 'This assignment does not exist'}, 400
+        if car.driver_id != driver_id:
+            return {'message': 'This assignment does not exist'}, 404
 
         car.driver_id = None
         db.session.commit()
         return {'message': 'Driver assignment deleted'}
 
+# API endpoints configuration
 api.add_resource(CarList, '/cars')
 api.add_resource(Car, '/car/<string:plate>')
 api.add_resource(CarPosition, '/car/<string:plate>/position')
