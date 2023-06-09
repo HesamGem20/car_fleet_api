@@ -1,0 +1,218 @@
+Certainly! Here's a modified version of the solution that you can directly copy and paste into your Python file:
+
+```python
+from flask import Flask, request
+from flask_restful import Api, Resource
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+import requests
+from passlib.hash import pbkdf2_sha512
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///data.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+api = Api(app)
+db = SQLAlchemy(app)
+
+class CarModel(db.Model):
+    __tablename__ = 'cars'
+
+    id = db.Column(db.Integer, primary_key=True)
+    license_plate = db.Column(db.String(10), unique=True, nullable=False)
+    driver_id = db.Column(db.Integer, db.ForeignKey('drivers.id'))
+    positions = db.relationship('PositionModel', backref='car', lazy='dynamic')
+
+    def json(self):
+        return {'id': self.id, 'license_plate': self.license_plate, 'driver_id': self.driver_id}
+
+class DriverModel(db.Model):
+    __tablename__ = 'drivers'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), nullable=False)
+    cars = db.relationship('CarModel', backref='driver', lazy='dynamic')
+
+    def json(self):
+        return {'id': self.id, 'name': self.name}
+
+class PositionModel(db.Model):
+    __tablename__ = 'positions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    date = db.Column(db.DateTime, default=datetime.utcnow)
+    car_id = db.Column(db.Integer, db.ForeignKey('cars.id'), nullable=False)
+    address = db.Column(db.String(300))
+
+    def json(self):
+        return {
+            'id': self.id,
+            'latitude': self.latitude,
+            'longitude': self.longitude,
+            'date': self.date.isoformat(),
+            'car_id': self.car_id,
+            'address': self.address
+        }
+
+    def resolve_address(self):
+        url = f"https://nominatim.openstreetmap.org/reverse?lat={self.latitude}&lon={self.longitude}&format=json"
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            self.address = data.get('display_name', '')
+        else:
+            self.address = ''
+
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    if 'username' not in data or 'password' not in data:
+        return {"message": "Username and password are required"}, 400
+
+    if UserModel.find_by_username(data['username']):
+        return {"message": "Username already exists"}, 400
+
+    user = UserModel(username=data['username'], password=UserModel.generate_hash(data['password']))
+    db.session.add(user)
+    db.session.commit()
+    return {"message": "User registered successfully"}, 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    if 'username' not in data or 'password' not in data:
+        return {"message": "Username and password are required"}, 400
+
+    user = UserModel.find_by_username(data['username'])
+    if user and UserModel.verify_hash(data['password'], user.password):
+        return {"message": "Login successful"}, 200
+    return {"message": "Invalid credentials"}, 401
+
+class Car(Resource):
+    @classmethod
+    def find_by_attribute(cls, **kwargs):
+        return cls.query.filter_by(**kwargs).first()
+
+    def get(self, plate):
+        car =
+
+ CarModel.find_by_attribute(license_plate=plate)
+        if car:
+            return car.json()
+        return {'message': 'Car not found'}, 404
+
+    def post(self, plate):
+        if CarModel.find_by_attribute(license_plate=plate):
+            return {'message': 'Car already exists'}, 400
+
+        data = request.get_json()
+        driver_id = data.get('driver_id')
+
+        if driver_id and not DriverModel.find_by_attribute(id=driver_id):
+            return {'message': 'Driver not found'}, 400
+
+        car = CarModel(license_plate=plate, driver_id=driver_id)
+        db.session.add(car)
+        db.session.commit()
+        return car.json(), 201
+
+    def put(self, plate):
+        data = request.get_json()
+        driver_id = data.get('driver_id')
+
+        car = CarModel.find_by_attribute(license_plate=plate)
+        if not car:
+            return {'message': 'Car not found'}, 404
+
+        if driver_id and not DriverModel.find_by_attribute(id=driver_id):
+            return {'message': 'Driver not found'}, 400
+
+        car.driver_id = driver_id
+        db.session.commit()
+        return car.json()
+
+    def delete(self, plate):
+        car = CarModel.find_by_attribute(license_plate=plate)
+        if not car:
+            return {'message': 'Car not found'}, 404
+
+        db.session.delete(car)
+        db.session.commit()
+        return {'message': 'Car deleted'}
+
+class CarList(Resource):
+    def get(self):
+        cars = CarModel.query.all()
+        return {'cars': [car.json() for car in cars]}
+
+class CarPosition(Resource):
+    def post(self, plate):
+        car = CarModel.find_by_attribute(license_plate=plate)
+        if not car:
+            return {'message': 'Car not found'}, 404
+
+        data = request.get_json()
+        latitude = data.get('latitude')
+        longitude = data.get('longitude')
+
+        if not isinstance(latitude, float) or not isinstance(longitude, float):
+            return {'message': 'Latitude and longitude must be floats'}, 400
+
+        car_position = PositionModel(car_id=car.id, latitude=latitude, longitude=longitude)
+        car_position.date = datetime.now()
+        car_position.resolve_address()
+        db.session.add(car_position)
+        db.session.commit()
+        return {'message': 'Position saved successfully'}, 201
+
+class CarPositions(Resource):
+    def get(self, plate):
+        car = CarModel.find_by_attribute(license_plate=plate)
+        if not car:
+            return {'message': 'Car not found'}, 404
+
+        positions = PositionModel.query.filter_by(car_id=car.id).all()
+        return {'positions': [position.json() for position in positions]}
+
+class AssignDriver(Resource):
+    def post(self, plate, driver_id):
+        car = CarModel.find_by_attribute(license_plate=plate)
+        if not car:
+            return {'message': 'Car not found'}, 404
+
+        driver = DriverModel.find_by_attribute(id=driver_id)
+        if not driver:
+            return {'message': 'Driver not found'}, 404
+
+        car.driver_id = driver.id
+        db.session.commit()
+        return {'message': 'Driver assigned successfully'}
+
+    def delete(self, plate, driver_id):
+        car = CarModel.find_by_attribute(license_plate=plate)
+        if not car:
+            return {'message': 'Car not found'}, 404
+
+        driver = DriverModel.find_by_attribute(id=driver_id)
+        if not driver:
+            return {'message': 'Driver not found'}, 404
+
+        if car.driver_id != driver.id:
+            return {'message': 'This assignment does
+
+ not exist'}, 400
+
+        car.driver_id = None
+        db.session.commit()
+        return {'message': 'Driver assignment deleted'}
+
+api.add_resource(CarList, '/cars')
+api.add_resource(Car, '/car/<string:plate>')
+api.add_resource(CarPosition, '/car/<string:plate>/position')
+api.add_resource(CarPositions, '/car/<string:plate>/positions')
+api.add_resource(AssignDriver, '/car/<string:plate>/driver/<int:driver_id>')
+
+if __name__ == '__main__':
+    db.init_app(app)
+    app.run(debug=True)
